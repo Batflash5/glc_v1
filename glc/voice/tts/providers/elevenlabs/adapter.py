@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 
 import httpx
 
@@ -98,13 +99,33 @@ class Provider(TTSProvider):
     def _chunk_text(text: str, max_chars: int = 5000) -> list[str]:
         """Split text into chunks of at most max_chars on sentence boundaries.
 
-        TODO (Anshul): implement.
         Rules:
           - Split on . ? ! without cutting mid-word.
-          - A single token longer than max_chars is kept as one unsplit chunk.
+          - A single sentence longer than max_chars is kept as one unsplit
+            chunk (so no word is ever cut).
           - Empty string returns [].
-        Current stub: returns the whole string as a single chunk.
+
+        Every character of the original text is preserved across the chunks,
+        so concatenating the per-chunk audio reproduces the full utterance.
         """
         if not text:
             return []
-        return [text]
+        # Each sentence keeps its trailing . ? ! (and any run of them); a final
+        # fragment without terminating punctuation is captured too.
+        sentences = re.findall(r"[^.?!]*[.?!]+|[^.?!]+", text)
+        chunks: list[str] = []
+        current = ""
+        for sentence in sentences:
+            if len(sentence) > max_chars:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.append(sentence)
+            elif len(current) + len(sentence) > max_chars:
+                chunks.append(current)
+                current = sentence
+            else:
+                current += sentence
+        if current:
+            chunks.append(current)
+        return chunks

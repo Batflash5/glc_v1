@@ -16,9 +16,13 @@ from __future__ import annotations
 import base64
 import os
 
+import httpx
+
 from glc.voice.tts.base import SynthesizeResult, TTSError, TTSProvider
+from glc.voice.tts.providers.elevenlabs.schemas import ElevenLabsRequest
 
 DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
+ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
 
 
 class Provider(TTSProvider):
@@ -73,15 +77,22 @@ class Provider(TTSProvider):
     async def _call_upstream(self, text: str, voice_id: str) -> bytes:
         """POST one chunk to the ElevenLabs API and return raw MP3 bytes.
 
-        TODO (Anshul): implement.
         Endpoint : POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}
         Auth     : xi-api-key header (NOT Authorization: Bearer)
         Body     : ElevenLabsRequest(text=text).model_dump(exclude_none=True)
-        On httpx.HTTPStatusError  → re-raise as TTSError(str(e), status=e.response.status_code)
-        On httpx.RequestError     → re-raise as TTSError(str(e), status=503)
-        Return   : response.content  (raw bytes)
+        Return   : response.content  (raw MP3 bytes)
+
+        Raises httpx.HTTPStatusError on non-2xx and httpx.RequestError on
+        network failure. Translating those into TTSError is Vichitravir's
+        error-handling deliverable (wraps this call).
         """
-        raise NotImplementedError("real HTTP path — TODO (Anshul)")
+        url = ELEVENLABS_TTS_URL.format(voice_id=voice_id)
+        headers = {"xi-api-key": self._api_key}
+        body = ElevenLabsRequest(text=text).model_dump(exclude_none=True)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=body)
+            response.raise_for_status()
+        return response.content
 
     @staticmethod
     def _chunk_text(text: str, max_chars: int = 5000) -> list[str]:

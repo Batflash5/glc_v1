@@ -14,15 +14,18 @@ Architectural decisions (set by Hari — do not change without team discussion):
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
+from datetime import datetime
+from pathlib import Path
 
 import httpx
 
 from glc.voice.tts.base import SynthesizeResult, TTSError, TTSProvider
 from glc.voice.tts.providers.elevenlabs.schemas import ElevenLabsRequest
 
-DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
+DEFAULT_VOICE_ID = "eoIFRkuKCeTGYlRFffIU"
 ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
 
 
@@ -56,6 +59,7 @@ class Provider(TTSProvider):
         audio_bytes = b""
         for chunk in chunks:
             audio_bytes += await self._call_upstream(chunk, voice_id or self._voice_id)
+        self._persist_real_quota(len(text))
         return SynthesizeResult(
             audio_b64=base64.b64encode(audio_bytes).decode("ascii"),
             mime="audio/mpeg",
@@ -67,13 +71,28 @@ class Provider(TTSProvider):
     def _check_quota(self, text: str, mock: object | None = None) -> None:
         """Pre-flight monthly character quota check.
 
-        TODO (Vichitravir): implement.
-        Mock path : read mock.monthly_chars_used and mock.monthly_chars_limit.
-        Real path : read/write ~/.glc/elevenlabs_quota.json keyed by YYYY-MM.
-        Raise TTSError("monthly quota limit exceeded", status=429) when
-        monthly_chars_used + len(text) > monthly_chars_limit.
-        The error message MUST contain "quota" or "limit" (tests assert this).
+        Mock path : reads mock.monthly_chars_used and mock.monthly_chars_limit.
+        Real path : reads ~/.glc/elevenlabs_quota.json keyed by YYYY-MM.
+        Raises TTSError(status=429) before any HTTP call when the quota
+        would be exceeded.  Message contains "quota" or "limit" as required
+        by the test assertions.
         """
+        if mock is not None:
+            used: int = getattr(mock, "monthly_chars_used", 0)
+            limit: int = getattr(mock, "monthly_chars_limit", 10_000)
+        else:
+            month_key = datetime.now().strftime("%Y-%m")
+            quota_file = Path.home() / ".glc" / "elevenlabs_quota.json"
+            data: dict[str, int] = {}
+            if quota_file.exists():
+                try:
+                    data = json.loads(quota_file.read_text())
+                except (json.JSONDecodeError, OSError):
+                    data = {}
+            used = data.get(month_key, 0)
+            limit = 10_000
+        if used + len(text) > limit:
+            raise TTSError("monthly quota limit exceeded", status=429)
 
     async def _call_upstream(self, text: str, voice_id: str) -> bytes:
         """POST one chunk to the ElevenLabs API and return raw MP3 bytes.
@@ -82,18 +101,33 @@ class Provider(TTSProvider):
         Auth     : xi-api-key header (NOT Authorization: Bearer)
         Body     : ElevenLabsRequest(text=text).model_dump(exclude_none=True)
         Return   : response.content  (raw MP3 bytes)
-
-        Raises httpx.HTTPStatusError on non-2xx and httpx.RequestError on
-        network failure. Translating those into TTSError is Vichitravir's
-        error-handling deliverable (wraps this call).
         """
         url = ELEVENLABS_TTS_URL.format(voice_id=voice_id)
         headers = {"xi-api-key": self._api_key}
         body = ElevenLabsRequest(text=text).model_dump(exclude_none=True)
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, json=body)
-            response.raise_for_status()
-        return response.content
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, headers=headers, json=body)
+                response.raise_for_status()
+            return response.content
+        except httpx.HTTPStatusError as exc:
+            raise TTSError(str(exc), status=exc.response.status_code) from exc
+        except httpx.RequestError as exc:
+            raise TTSError(str(exc), status=503) from exc
+
+    def _persist_real_quota(self, chars: int) -> None:
+        """Increment the real-path monthly character counter after a successful synthesis."""
+        month_key = datetime.now().strftime("%Y-%m")
+        quota_file = Path.home() / ".glc" / "elevenlabs_quota.json"
+        data: dict[str, int] = {}
+        if quota_file.exists():
+            try:
+                data = json.loads(quota_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                data = {}
+        data[month_key] = data.get(month_key, 0) + chars
+        quota_file.parent.mkdir(parents=True, exist_ok=True)
+        quota_file.write_text(json.dumps(data))
 
     @staticmethod
     def _chunk_text(text: str, max_chars: int = 5000) -> list[str]:

@@ -15,10 +15,15 @@ from __future__ import annotations
 
 import base64
 import os
+import re
+
+import httpx
 
 from glc.voice.tts.base import SynthesizeResult, TTSError, TTSProvider
+from glc.voice.tts.providers.elevenlabs.schemas import ElevenLabsRequest
 
 DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
+ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
 
 
 class Provider(TTSProvider):
@@ -73,27 +78,54 @@ class Provider(TTSProvider):
     async def _call_upstream(self, text: str, voice_id: str) -> bytes:
         """POST one chunk to the ElevenLabs API and return raw MP3 bytes.
 
-        TODO (Anshul): implement.
         Endpoint : POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}
         Auth     : xi-api-key header (NOT Authorization: Bearer)
         Body     : ElevenLabsRequest(text=text).model_dump(exclude_none=True)
-        On httpx.HTTPStatusError  → re-raise as TTSError(str(e), status=e.response.status_code)
-        On httpx.RequestError     → re-raise as TTSError(str(e), status=503)
-        Return   : response.content  (raw bytes)
+        Return   : response.content  (raw MP3 bytes)
+
+        Raises httpx.HTTPStatusError on non-2xx and httpx.RequestError on
+        network failure. Translating those into TTSError is Vichitravir's
+        error-handling deliverable (wraps this call).
         """
-        raise NotImplementedError("real HTTP path — TODO (Anshul)")
+        url = ELEVENLABS_TTS_URL.format(voice_id=voice_id)
+        headers = {"xi-api-key": self._api_key}
+        body = ElevenLabsRequest(text=text).model_dump(exclude_none=True)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=body)
+            response.raise_for_status()
+        return response.content
 
     @staticmethod
     def _chunk_text(text: str, max_chars: int = 5000) -> list[str]:
         """Split text into chunks of at most max_chars on sentence boundaries.
 
-        TODO (Anshul): implement.
         Rules:
           - Split on . ? ! without cutting mid-word.
-          - A single token longer than max_chars is kept as one unsplit chunk.
+          - A single sentence longer than max_chars is kept as one unsplit
+            chunk (so no word is ever cut).
           - Empty string returns [].
-        Current stub: returns the whole string as a single chunk.
+
+        Every character of the original text is preserved across the chunks,
+        so concatenating the per-chunk audio reproduces the full utterance.
         """
         if not text:
             return []
-        return [text]
+        # Each sentence keeps its trailing . ? ! (and any run of them); a final
+        # fragment without terminating punctuation is captured too.
+        sentences = re.findall(r"[^.?!]*[.?!]+|[^.?!]+", text)
+        chunks: list[str] = []
+        current = ""
+        for sentence in sentences:
+            if len(sentence) > max_chars:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.append(sentence)
+            elif len(current) + len(sentence) > max_chars:
+                chunks.append(current)
+                current = sentence
+            else:
+                current += sentence
+        if current:
+            chunks.append(current)
+        return chunks
